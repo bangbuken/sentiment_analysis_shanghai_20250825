@@ -1,138 +1,216 @@
-# 2025年8月25日，上海市出台《关于优化调整本市房地产政策措施的通知》，想了解政策发布后的网络舆情。
-# https://fgj.sh.gov.cn/gzdt/20250825/fe28d1dd27214dc6823dedfd9ccd5b97.html
-
-import requests
-from bs4 import BeautifulSoup
-import chardet
-import re
+import time
+import random
 import pandas as pd
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from transformers import pipeline
+from urllib.parse import quote
+from bs4 import BeautifulSoup
+import requests
+import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'Microsoft YaHei'
+from wordcloud import WordCloud, STOPWORDS
+from collections import Counter
+import jieba
 
-# =====================
-# 1. 数据采集模块
-# =====================
+# ---------------------------
+# 配置
+# ---------------------------
+FILTER_KEYWORDS = ["楼", "房", "政", "市"]
+EXCLUDE_KEYWORDS = ["游戏", "体育", "娱乐"]
+TIME_LIMIT = datetime(2025, 8, 25)
 
-def send_request(url, headers=None):
-    """向URL发送请求并返回BeautifulSoup对象"""
-    soup = None
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        result = chardet.detect(response.content)
-        encoding = result['encoding']
-        response.encoding = encoding
-        soup = BeautifulSoup(response.text, 'html.parser')
-    else:
-        print(f"请求 {url} 失败，状态码: {response.status_code}")
-    return soup
+# ---------------------------
+# 1) 情感分析模型
+# ---------------------------
+classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-def extract_news_titles(soup, tag='a', pattern=r'.*'):
-    """从HTML中提取符合pattern的标题"""
-    titles = []
-    if soup:
-        for element in soup.find_all(tag):
-            text = element.get_text(strip=True)
-            if re.match(pattern, text):
-                titles.append(text)
-    return titles
+def sentiment_score(text):
+    outputs = classifier(text[:512])
+    return outputs[0]['label'], outputs[0]['score']
 
-def collect_data_from_platforms(keyword):
-    """从多个平台收集新闻/帖子标题"""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    data = {}
+# ---------------------------
+# 2) Selenium 设置
+# ---------------------------
+def get_driver(headless=True):
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--window-size=1920,1080")
+    service = Service()
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
 
-    # 平台1: 百度新闻搜索
-    url_baidu = f"https://www.baidu.com/s?wd={keyword}"
-    soup_baidu = send_request(url_baidu, headers=headers)
-    data["baidu"] = extract_news_titles(soup_baidu, tag='a')
+# ---------------------------
+# 3) 抓取搜索结果
+# ---------------------------
+def search_sina_news_selenium(keyword, max_pages=50):
+    driver = get_driver()
+    keyword_encoded = quote(keyword)
+    base_url = f"https://search.sina.com.cn/?q={keyword_encoded}&c=news&from=channel"
+    driver.get(base_url)
+    time.sleep(random.uniform(0.2, 0.4))
 
-    # 平台2: 搜狐新闻搜索
-    url_sohu = f"https://search.sohu.com/?keyword={keyword}"
-    soup_sohu = send_request(url_sohu, headers=headers)
-    data["sohu"] = extract_news_titles(soup_sohu, tag='a')
+    all_news = []
+    seen_urls = set()
 
-    # 平台3: 新浪新闻搜索
-    url_sina = f"https://search.sina.com.cn/?q={keyword}"
-    soup_sina = send_request(url_sina, headers=headers)
-    data["sina"] = extract_news_titles(soup_sina, tag='a')
-
-    # TODO: 微博、知乎、抖音等平台需要登录或API支持，这里仅保留结构接口
-    data["weibo"] = [f"模拟微博帖子: {keyword}相关讨论"]
-    data["zhihu"] = [f"模拟知乎问答: {keyword}的看法"]
-
-    return data
-
-# =====================
-# 2. 情感分析模块
-# =====================
-
-classifier = pipeline("sentiment-analysis", model="IDEA-CCNL/Erlangshen-RoBERTa-110M-Sentiment")
-
-def analyze_sentiment(texts, platform_name="unknown"):
-    """对文本列表进行情感分析，返回结果DataFrame"""
-    results = []
-    for text in texts:
+    for page in range(max_pages):
         try:
-            outputs = classifier(text[:512])
-            label = outputs[0]['label']
-            score = outputs[0]['score']
-            results.append({"platform": platform_name, "text": text, "label": label, "score": score})
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.box-result"))
+            )
+            items = driver.find_elements(By.CSS_SELECTOR, "div.box-result a[target='_blank']")
+            for item in items:
+                title = item.text.strip()
+                url = item.get_attribute("href").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                # 必须包含关键词“上海”
+                if "上海" not in title:
+                    continue
+
+                if FILTER_KEYWORDS and not any(k in title for k in FILTER_KEYWORDS):
+                    continue
+                if EXCLUDE_KEYWORDS and any(k in title for k in EXCLUDE_KEYWORDS):
+                    continue
+
+                # 发布时间限制
+                try:
+                    pub_elem = item.find_element(By.XPATH, "./following-sibling::span")
+                    pub_str = pub_elem.text.strip()
+                    pub_date = datetime.strptime(pub_str.split()[0], "%Y-%m-%d")
+                    if pub_date < TIME_LIMIT:
+                        continue
+                except:
+                    pass
+
+                all_news.append({"title": title, "url": url})
+            print(f"第 {page+1} 页抓取到 {len(items)} 条新闻，累计 {len(all_news)} 条")
         except Exception as e:
-            print(f"分析失败: {e}")
-    return pd.DataFrame(results)
+            print(f"第 {page+1} 页异常: {e}")
 
-# =====================
-# 3. 指数计算模块
-# =====================
+        # 翻页
+        try:
+            next_btn = driver.find_element(By.LINK_TEXT, "下一页")
+            if "javascript:void(0)" in next_btn.get_attribute("href"):
+                print("已到最后一页")
+                break
+            next_btn.click()
+            time.sleep(random.uniform(0.2, 0.4))
+        except Exception:
+            print("没有找到下一页按钮或已到最后一页")
+            break
 
-def compute_sentiment_index(df):
-    if df.empty:
-        return 0
-    pos = len(df[df['label'].str.contains('positive')])
-    neg = len(df[df['label'].str.contains('negative')])
-    total = len(df)
-    return (pos - neg) / total if total > 0 else 0
+    driver.quit()
+    return all_news
 
-# =====================
-# 4. 可视化模块
-# =====================
+# ---------------------------
+# 4) 获取新闻正文
+# ---------------------------
+def fetch_news_content(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return ""
+        r.encoding = r.apparent_encoding
+        soup = BeautifulSoup(r.text, "html.parser")
+        candidates = [
+            soup.find(id="artibody"),
+            soup.find("div", class_="article"),
+            soup.find("div", id="article"),
+            soup.find("div", class_="newstext"),
+            soup.find("article"),
+        ]
+        for tag in candidates:
+            if tag:
+                txt = tag.get_text(separator="\n", strip=True)
+                if txt and len(txt) > 30:
+                    return txt
+        return soup.get_text(separator="\n", strip=True)
+    except:
+        return ""
 
-def plot_sentiment_distribution(df):
-    counts = df['label'].value_counts()
-    plt.figure(figsize=(6, 6))
-    plt.pie(counts, labels=counts.index, autopct='%1.1f%%', startangle=90)
-    plt.title("情感分布")
-    plt.show()
+# ---------------------------
+# 5) 保存 Excel 并生成图表
+# ---------------------------
+def plot_sentiment_pie(data, filename="sentiment_pie.png"):
+    labels = [row[3] for row in data]
+    counter = Counter(labels)
+    total = sum(counter.values())
+    sizes = [v / total for v in counter.values()]
+    plt.figure(figsize=(6,6))
+    plt.pie(sizes, labels=counter.keys(), autopct='%1.1f%%', startangle=90, colors=["#66c2a5","#fc8d62","#8da0cb"])
+    plt.title("新闻情感比例")
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"情感比例饼状图已保存到 {filename}")
 
-def generate_wordcloud(df):
-    text_all = " ".join(df['text'].tolist())
-    wc = WordCloud(font_path='simhei.ttf', background_color='white', width=800, height=400).generate(text_all)
-    plt.figure(figsize=(10, 5))
-    plt.imshow(wc, interpolation='bilinear')
-    plt.axis('off')
-    plt.title("高频词词云")
-    plt.show()
+def plot_title_wordcloud(data, filename="title_wordcloud.png"):
+    titles = [row[1] for row in data]
+    text = " ".join(titles)
+    words = jieba.cut(text)
+    text_cut = " ".join(words)
+    stopwords = set(STOPWORDS)
+    stopwords.update(["新闻","报道","表示","公司","上海","楼市","房地产"])
+    wc = WordCloud(font_path="simhei.ttf", width=800, height=600, background_color="white", stopwords=stopwords)
+    wc.generate(text_cut)
+    plt.figure(figsize=(10,8))
+    plt.imshow(wc, interpolation="bilinear")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"标题词云已保存到 {filename}")
 
-# =====================
-# 5. 主流程示例
-# =====================
+def save_to_excel(data, filename="sina_news.xlsx"):
+    df = pd.DataFrame(data, columns=["新闻URL", "标题", "正文", "情感", "置信度"])
+    df.to_excel(filename, index=False, engine="openpyxl")
+    print(f"数据已保存到 {filename}")
+    plot_sentiment_pie(data)
+    plot_title_wordcloud(data)
+
+# ---------------------------
+# 6) 主流程
+# ---------------------------
+def run_pipeline(keywords=["上海房地产", "上海楼市新政", "限购政策"], max_pages_per_keyword=None):
+    all_results = []
+    seen_urls = set()
+
+    for kw in keywords:
+        print(f"\n=== 抓取关键词: {kw} ===")
+        news_list = search_sina_news_selenium(kw, max_pages=max_pages_per_keyword)
+        print(f"关键词[{kw}] 共抓到 {len(news_list)} 条候选链接")
+
+        for news in news_list:
+            if news['url'] in seen_urls:
+                continue
+            seen_urls.add(news['url'])
+            content = fetch_news_content(news['url'])
+            if not content:
+                continue
+            label, score = sentiment_score(news['title'] + " " + content)
+            all_results.append([news['url'], news['title'], content, label, score])
+            time.sleep(random.uniform(0.2, 0.6))
+
+    save_to_excel(all_results)
+
+# ---------------------------
+# 7) 运行示例
+# ---------------------------
 if __name__ == "__main__":
-    keyword = "上海楼市新政"
-    platform_data = collect_data_from_platforms(keyword)
-
-    all_dfs = []
-    for platform, texts in platform_data.items():
-        print(f"平台 {platform} 采集到 {len(texts)} 条")
-        df_platform = analyze_sentiment(texts, platform_name=platform)
-        all_dfs.append(df_platform)
-
-    df_all = pd.concat(all_dfs, ignore_index=True)
-    print(df_all.head())
-
-    sentiment_index = compute_sentiment_index(df_all)
-    print(f"总体情感指数: {sentiment_index:.2f}")
-
-    if not df_all.empty:
-        plot_sentiment_distribution(df_all)
-        generate_wordcloud(df_all)
+    run_pipeline(keywords=[
+        "上海房地产", "上海楼市新政", "上海限购政策",
+        "沪六条", "上海825", "上海房地产调控"
+    ], max_pages_per_keyword=10)
