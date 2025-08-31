@@ -21,14 +21,15 @@ import jieba
 # ---------------------------
 # 配置
 # ---------------------------
-FILTER_KEYWORDS = ["楼", "房", "政", "市"]
+FILTER_KEYWORDS = ["楼", "房", "政", "市", "购", "买", "贷", "价", "限", "利率", "公积金"]
 EXCLUDE_KEYWORDS = ["游戏", "体育", "娱乐"]
 TIME_LIMIT = datetime(2025, 8, 25)
 
 # ---------------------------
 # 1) 情感分析模型
 # ---------------------------
-classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+# classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+classifier = pipeline("sentiment-analysis", model="yiyanghkust/finbert-tone-chinese")
 
 def sentiment_score(text):
     outputs = classifier(text[:512])
@@ -106,7 +107,7 @@ def search_sina_news_selenium(keyword, max_pages=50):
                 print("已到最后一页")
                 break
             next_btn.click()
-            time.sleep(random.uniform(0.2, 0.4))
+            time.sleep(random.uniform(0.1, 0.5))
         except Exception:
             print("没有找到下一页按钮或已到最后一页")
             break
@@ -202,7 +203,7 @@ def run_pipeline(keywords=["上海房地产", "上海楼市新政", "限购政�
                 continue
             label, score = sentiment_score(news['title'] + " " + content)
             all_results.append([news['url'], news['title'], content, label, score])
-            time.sleep(random.uniform(0.2, 0.6))
+            time.sleep(random.uniform(0.1, 0.5))
 
     save_to_excel(all_results)
 
@@ -211,6 +212,7 @@ def run_pipeline(keywords=["上海房地产", "上海楼市新政", "限购政�
 # ---------------------------
 if __name__ == "__main__":
     run_pipeline(keywords=[
-        "上海房地产", "上海楼市新政", "上海限购政策",
-        "沪六条", "上海825", "上海房地产调控"
-    ], max_pages_per_keyword=10)
+        "上海房地产", "上海楼市", "上海房地产新政", "上海楼市新政", "上海限购政策",
+        "沪六条", "上海825", "上海房地产调控", "上海外环", "上海取消限购",
+        "上海楼市限购", "上海房贷", "上海买房", "上海公积金"
+    ], max_pages_per_keyword=20)
