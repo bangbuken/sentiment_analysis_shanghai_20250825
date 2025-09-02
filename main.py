@@ -10,8 +10,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from transformers import pipeline
 from urllib.parse import quote
-from bs4 import BeautifulSoup
-import requests
 import matplotlib.pyplot as plt
 plt.rcParams['font.family'] = 'Microsoft YaHei'
 from wordcloud import WordCloud, STOPWORDS
@@ -25,10 +23,7 @@ FILTER_KEYWORDS = ["楼", "房", "政", "市", "购", "买", "贷", "价", "限"
 EXCLUDE_KEYWORDS = ["游戏", "体育", "娱乐"]
 TIME_LIMIT = datetime(2025, 8, 25)
 
-# ---------------------------
-# 1) 情感分析模型
-# ---------------------------
-# classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+# 情感分析模型
 classifier = pipeline("sentiment-analysis", model="yiyanghkust/finbert-tone-chinese")
 
 def sentiment_score(text):
@@ -36,7 +31,16 @@ def sentiment_score(text):
     return outputs[0]['label'], outputs[0]['score']
 
 # ---------------------------
-# 2) Selenium 设置
+# 微博 Cookie 配置
+# ---------------------------
+WEIBO_COOKIES = {
+    "SUB": "_2A25FsivMDeRhGedG41sQ9SnIyj-IHXVmziEErDV8PUNbmtANLUaskW9NUOk2bX3oBwt9lpeoTCjkFIufzwVlYmyA",
+    "SUBP": "0033WrSXqPxfM725Ws9jqgMF55529P9D9WFj7cf7HiukpvQikGSgy-5z5NHD95Qp1hn4eK-NSh20Ws4DqcjMi--NiK.Xi-2Ri--ciKnRi-zN1KLDMN90UNeN15tt",
+    # "SSOLoginState": "替换成你的SSOLoginState" # 不是必需
+}
+
+# ---------------------------
+# Selenium 设置
 # ---------------------------
 def get_driver(headless=True):
     chrome_options = Options()
@@ -48,124 +52,122 @@ def get_driver(headless=True):
     chrome_options.add_argument("--window-size=1920,1080")
     service = Service()
     driver = webdriver.Chrome(service=service, options=chrome_options)
+
+    # 先打开一次微博主页，再注入 cookie
+    driver.get("https://weibo.com/")
+    time.sleep(3)
+    for k, v in WEIBO_COOKIES.items():
+        driver.add_cookie({"name": k, "value": v, "domain": ".weibo.com"})
+    driver.refresh()
+    time.sleep(2)
     return driver
 
+
 # ---------------------------
-# 3) 抓取搜索结果
+# 1) 搜索微博帖子
 # ---------------------------
-def search_sina_news_selenium(keyword, max_pages=50):
+def search_weibo_posts(keyword, max_pages=5):
     driver = get_driver()
     keyword_encoded = quote(keyword)
-    base_url = f"https://search.sina.com.cn/?q={keyword_encoded}&c=news&from=channel"
+    base_url = f"https://s.weibo.com/weibo?q={keyword_encoded}"
     driver.get(base_url)
-    time.sleep(random.uniform(0.2, 0.4))
+    time.sleep(random.uniform(0.5, 1.0))
 
-    all_news = []
-    seen_urls = set()
+    all_posts = []
+    seen_ids = set()
 
     for page in range(max_pages):
         try:
             WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.box-result"))
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.card-wrap"))
             )
-            items = driver.find_elements(By.CSS_SELECTOR, "div.box-result a[target='_blank']")
+            items = driver.find_elements(By.CSS_SELECTOR, "div.card-wrap")
+
             for item in items:
-                title = item.text.strip()
-                url = item.get_attribute("href").strip()
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-
-                # 必须包含关键词“上海”
-                if "上海" not in title:
-                    continue
-
-                if FILTER_KEYWORDS and not any(k in title for k in FILTER_KEYWORDS):
-                    continue
-                if EXCLUDE_KEYWORDS and any(k in title for k in EXCLUDE_KEYWORDS):
-                    continue
-
-                # 发布时间限制
                 try:
-                    pub_elem = item.find_element(By.XPATH, "./following-sibling::span")
-                    pub_str = pub_elem.text.strip()
-                    pub_date = datetime.strptime(pub_str.split()[0], "%Y-%m-%d")
-                    if pub_date < TIME_LIMIT:
+                    mid = item.get_attribute("mid")
+                    if not mid or mid in seen_ids:
                         continue
+                    seen_ids.add(mid)
+
+                    # 帖子正文
+                    content_elem = item.find_element(By.CSS_SELECTOR, "p.txt")
+                    content = content_elem.text.strip()
+                    if not content:
+                        continue
+
+                    # 必须包含关键词“上海”
+                    if "上海" not in content:
+                        continue
+                    if FILTER_KEYWORDS and not any(k in content for k in FILTER_KEYWORDS):
+                        continue
+                    if EXCLUDE_KEYWORDS and any(k in content for k in EXCLUDE_KEYWORDS):
+                        continue
+
+                    # 发布时间
+                    try:
+                        time_elem = item.find_element(By.CSS_SELECTOR, "p.from a")
+                        pub_str = time_elem.text.strip()
+                        if "2025" in pub_str:
+                            pub_date = datetime.strptime(pub_str.split()[0], "%Y-%m-%d")
+                            if pub_date < TIME_LIMIT:
+                                continue
+                        else:
+                            pub_date = None
+                    except:
+                        pub_date = None
+
+                    all_posts.append({
+                        "mid": mid,
+                        "content": content,
+                        "pub_date": pub_date
+                    })
                 except:
-                    pass
+                    continue
 
-                all_news.append({"title": title, "url": url})
-            print(f"第 {page+1} 页抓取到 {len(items)} 条新闻，累计 {len(all_news)} 条")
-        except Exception as e:
-            print(f"第 {page+1} 页异常: {e}")
+            print(f"第 {page+1} 页抓取到 {len(all_posts)} 条帖子")
 
-        # 翻页
-        try:
-            next_btn = driver.find_element(By.LINK_TEXT, "下一页")
-            if "javascript:void(0)" in next_btn.get_attribute("href"):
+            # 翻页
+            try:
+                next_btn = driver.find_element(By.LINK_TEXT, "下一页")
+                next_btn.click()
+                time.sleep(random.uniform(1, 2))
+            except:
                 print("已到最后一页")
                 break
-            next_btn.click()
-            time.sleep(random.uniform(0.1, 0.5))
-        except Exception:
-            print("没有找到下一页按钮或已到最后一页")
+
+        except Exception as e:
+            print(f"第 {page+1} 页异常: {e}")
             break
 
     driver.quit()
-    return all_news
+    return all_posts
 
 # ---------------------------
-# 4) 获取新闻正文
+# 2) 保存 Excel 并生成图表
 # ---------------------------
-def fetch_news_content(url):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return ""
-        r.encoding = r.apparent_encoding
-        soup = BeautifulSoup(r.text, "html.parser")
-        candidates = [
-            soup.find(id="artibody"),
-            soup.find("div", class_="article"),
-            soup.find("div", id="article"),
-            soup.find("div", class_="newstext"),
-            soup.find("article"),
-        ]
-        for tag in candidates:
-            if tag:
-                txt = tag.get_text(separator="\n", strip=True)
-                if txt and len(txt) > 30:
-                    return txt
-        return soup.get_text(separator="\n", strip=True)
-    except:
-        return ""
-
-# ---------------------------
-# 5) 保存 Excel 并生成图表
-# ---------------------------
-def plot_sentiment_pie(data, filename="sentiment_pie.png"):
-    labels = [row[3] for row in data]
+def plot_sentiment_pie(data, filename="weibo_sentiment_pie.png"):
+    labels = [row[2] for row in data]
     counter = Counter(labels)
     total = sum(counter.values())
     sizes = [v / total for v in counter.values()]
     plt.figure(figsize=(6,6))
-    plt.pie(sizes, labels=counter.keys(), autopct='%1.1f%%', startangle=90, colors=["#66c2a5","#fc8d62","#8da0cb"])
-    plt.title("新闻情感比例")
+    plt.pie(sizes, labels=counter.keys(), autopct='%1.1f%%', startangle=90,
+            colors=["#66c2a5","#fc8d62","#8da0cb"])
+    plt.title("微博舆情情感比例")
     plt.savefig(filename, dpi=300)
     plt.close()
     print(f"情感比例饼状图已保存到 {filename}")
 
-def plot_title_wordcloud(data, filename="title_wordcloud.png"):
-    titles = [row[1] for row in data]
-    text = " ".join(titles)
+def plot_wordcloud(data, filename="weibo_wordcloud.png"):
+    texts = [row[1] for row in data]
+    text = " ".join(texts)
     words = jieba.cut(text)
     text_cut = " ".join(words)
     stopwords = set(STOPWORDS)
-    stopwords.update(["新闻","报道","表示","公司","上海","楼市","房地产"])
-    wc = WordCloud(font_path="simhei.ttf", width=800, height=600, background_color="white", stopwords=stopwords)
+    stopwords.update(["微博","转发","评论","上海","楼市","新政"])
+    wc = WordCloud(font_path="simhei.ttf", width=800, height=600,
+                   background_color="white", stopwords=stopwords)
     wc.generate(text_cut)
     plt.figure(figsize=(10,8))
     plt.imshow(wc, interpolation="bilinear")
@@ -173,46 +175,40 @@ def plot_title_wordcloud(data, filename="title_wordcloud.png"):
     plt.tight_layout()
     plt.savefig(filename, dpi=300)
     plt.close()
-    print(f"标题词云已保存到 {filename}")
+    print(f"词云已保存到 {filename}")
 
-def save_to_excel(data, filename="sina_news.xlsx"):
-    df = pd.DataFrame(data, columns=["新闻URL", "标题", "正文", "情感", "置信度"])
+def save_to_excel(data, filename="weibo_posts.xlsx"):
+    df = pd.DataFrame(data, columns=["微博ID", "内容", "情感", "置信度"])
     df.to_excel(filename, index=False, engine="openpyxl")
     print(f"数据已保存到 {filename}")
     plot_sentiment_pie(data)
-    plot_title_wordcloud(data)
+    plot_wordcloud(data)
 
 # ---------------------------
-# 6) 主流程
+# 3) 主流程
 # ---------------------------
-def run_pipeline(keywords=["上海房地产", "上海楼市新政", "限购政策"], max_pages_per_keyword=None):
+def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
     all_results = []
-    seen_urls = set()
+    seen_ids = set()
 
     for kw in keywords:
         print(f"\n=== 抓取关键词: {kw} ===")
-        news_list = search_sina_news_selenium(kw, max_pages=max_pages_per_keyword)
-        print(f"关键词[{kw}] 共抓到 {len(news_list)} 条候选链接")
+        posts = search_weibo_posts(kw, max_pages=max_pages_per_keyword)
+        print(f"关键词[{kw}] 共抓到 {len(posts)} 条微博")
 
-        for news in news_list:
-            if news['url'] in seen_urls:
+        for post in posts:
+            if post['mid'] in seen_ids:
                 continue
-            seen_urls.add(news['url'])
-            content = fetch_news_content(news['url'])
-            if not content:
-                continue
-            label, score = sentiment_score(news['title'] + " " + content)
-            all_results.append([news['url'], news['title'], content, label, score])
-            time.sleep(random.uniform(0.1, 0.5))
+            seen_ids.add(post['mid'])
+
+            label, score = sentiment_score(post['content'])
+            all_results.append([post['mid'], post['content'], label, score])
+            time.sleep(random.uniform(0.2, 0.5))
 
     save_to_excel(all_results)
 
 # ---------------------------
-# 7) 运行示例
+# 运行示例
 # ---------------------------
 if __name__ == "__main__":
-    run_pipeline(keywords=[
-        "上海房地产", "上海楼市", "上海房地产新政", "上海楼市新政", "上海限购政策",
-        "沪六条", "上海825", "上海房地产调控", "上海外环", "上海取消限购",
-        "上海楼市限购", "上海房贷", "上海买房", "上海公积金"
-    ], max_pages_per_keyword=20)
+    run_pipeline(keywords=["上海楼市新政", "上海房地产", "沪六条"], max_pages_per_keyword=5)
