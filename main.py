@@ -2,6 +2,7 @@ import time
 import random
 import pandas as pd
 from datetime import datetime
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -15,6 +16,7 @@ plt.rcParams['font.family'] = 'Microsoft YaHei'
 from wordcloud import WordCloud, STOPWORDS
 from collections import Counter
 import jieba
+import re
 
 # ---------------------------
 # 配置
@@ -39,6 +41,11 @@ WEIBO_COOKIES = {
     # "SSOLoginState": "替换成你的SSOLoginState" # 不是必需
 }
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Referer": "https://weibo.com/",
+}
+
 # ---------------------------
 # Selenium 设置
 # ---------------------------
@@ -61,7 +68,6 @@ def get_driver(headless=True):
     driver.refresh()
     time.sleep(2)
     return driver
-
 
 # ---------------------------
 # 1) 搜索微博帖子
@@ -96,7 +102,6 @@ def search_weibo_posts(keyword, max_pages=5):
                     if not content:
                         continue
 
-                    # 必须包含关键词“上海”
                     if "上海" not in content:
                         continue
                     if FILTER_KEYWORDS and not any(k in content for k in FILTER_KEYWORDS):
@@ -144,32 +149,98 @@ def search_weibo_posts(keyword, max_pages=5):
     return all_posts
 
 # ---------------------------
-# 2) 保存 Excel 并生成图表
+# 2) 抓取评论
+# ---------------------------
+def fetch_comments(mid, max_pages=3, count=20):
+    """通过微博 JSON 接口抓取评论"""
+    comments = []
+    session = requests.Session()
+    session.cookies.update(WEIBO_COOKIES)
+    session.headers.update(HEADERS)
+
+    for page in range(1, max_pages+1):
+        url = f"https://weibo.com/ajax/statuses/buildComments?flow=0&is_reload=1&id={mid}&is_show_bulletin=2&count={count}&page={page}"
+        try:
+            res = session.get(url, timeout=10)
+            if res.status_code != 200:
+                print(f"评论请求失败 mid={mid}, code={res.status_code}")
+                break
+            data = res.json()
+            if "data" not in data or not data["data"]:
+                break
+            for c in data["data"]:
+                text = c.get("text_raw", "").strip()
+                if text:
+                    comments.append(text)
+        except Exception as e:
+            print(f"抓取评论异常 mid={mid}, page={page}, err={e}")
+            break
+        time.sleep(random.uniform(0.5, 1.0))
+    return comments
+
+# ---------------------------
+# 3) 保存 Excel 并生成图表
 # ---------------------------
 def plot_sentiment_pie(data, filename="weibo_sentiment_pie.png"):
-    labels = [row[2] for row in data]
+    """
+    统计 data 中 第4列(索引3) 的情感标签占比并画饼图
+    data 的每行结构: [mid, 类型, 内容, 情感, 置信度]
+    """
+    labels = [row[3] for row in data if len(row) >= 4 and row[3]]
     counter = Counter(labels)
     total = sum(counter.values())
-    sizes = [v / total for v in counter.values()]
-    plt.figure(figsize=(6,6))
-    plt.pie(sizes, labels=counter.keys(), autopct='%1.1f%%', startangle=90,
-            colors=["#66c2a5","#fc8d62","#8da0cb"])
-    plt.title("微博舆情情感比例")
+    if total == 0:
+        print("没有可用于饼图的情感数据，跳过绘制。")
+        return
+
+    # 尽量按常见顺序展示；若不存在则按 counter 的键顺序
+    pref_order = ["positive", "neutral", "negative", "POSITIVE", "NEUTRAL", "NEGATIVE", "正向", "中性", "负向"]
+    keys = [k for k in pref_order if k in counter] or list(counter.keys())
+    sizes = [counter[k] / total for k in keys]
+
+    plt.figure(figsize=(6, 6))
+    plt.pie(sizes, labels=keys, autopct='%1.1f%%', startangle=90,
+            colors=["#66c2a5", "#8da0cb", "#fc8d62"][:len(keys)])
+    plt.title("微博舆情情感比例（主帖+评论）")
     plt.savefig(filename, dpi=300)
     plt.close()
     print(f"情感比例饼状图已保存到 {filename}")
 
+def _clean_text_for_wc(text: str) -> str:
+    """简易清洗：去链接/话题/@、控制符、表情符号（基础版），仅为词云可视化用"""
+    text = re.sub(r'http\S+', ' ', text)                # 链接
+    text = re.sub(r'#([^#]+)#', r' \1 ', text)          # #话题#
+    text = re.sub(r'@[\w\-\u4e00-\u9fa5]+', ' ', text)  # @用户
+    text = re.sub(r'[\u200b\r\n\t]', ' ', text)         # 零宽空格/换行
+    return text
+
 def plot_wordcloud(data, filename="weibo_wordcloud.png"):
-    texts = [row[1] for row in data]
-    text = " ".join(texts)
-    words = jieba.cut(text)
-    text_cut = " ".join(words)
+    """
+    用 第3列(索引2) 的文本内容生成词云
+    """
+    texts = [row[2] for row in data if len(row) >= 3 and row[2]]
+    if not texts:
+        print("没有可用于词云的文本，跳过绘制。")
+        return
+
+    # 拼接并切词
+    raw = " ".join(_clean_text_for_wc(t) for t in texts)
+    text_cut = " ".join(jieba.cut(raw))
+
     stopwords = set(STOPWORDS)
-    stopwords.update(["微博","转发","评论","上海","楼市","新政"])
-    wc = WordCloud(font_path="simhei.ttf", width=800, height=600,
-                   background_color="white", stopwords=stopwords)
+    # 扩充停用词（避免噪声）
+    stopwords.update([
+        "微博", "转发", "评论", "正文", "链接", "视频", "图片", "网页", "全文",
+        "主帖", "评论", "上海", "楼市", "新政", "展开", "收起", "查看", "今天", "大家",
+        "一个", "这个", "那个", "还是", "就是", "可以"
+    ])
+
+    wc = WordCloud(
+        font_path="simhei.ttf", width=1000, height=700,
+        background_color="white", stopwords=stopwords
+    )
     wc.generate(text_cut)
-    plt.figure(figsize=(10,8))
+    plt.figure(figsize=(10, 8))
     plt.imshow(wc, interpolation="bilinear")
     plt.axis("off")
     plt.tight_layout()
@@ -178,14 +249,17 @@ def plot_wordcloud(data, filename="weibo_wordcloud.png"):
     print(f"词云已保存到 {filename}")
 
 def save_to_excel(data, filename="weibo_posts.xlsx"):
-    df = pd.DataFrame(data, columns=["微博ID", "内容", "情感", "置信度"])
+    """
+    保持你的保存逻辑不变，只是调用修正后的画图函数
+    """
+    df = pd.DataFrame(data, columns=["微博ID", "类型", "内容", "情感", "置信度"])
     df.to_excel(filename, index=False, engine="openpyxl")
     print(f"数据已保存到 {filename}")
-    plot_sentiment_pie(data)
-    plot_wordcloud(data)
+    plot_sentiment_pie(data)     # 现在会用情感列统计
+    plot_wordcloud(data)         # 现在会用内容列生成词云
 
 # ---------------------------
-# 3) 主流程
+# 4) 主流程
 # ---------------------------
 def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
     all_results = []
@@ -201,9 +275,16 @@ def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
                 continue
             seen_ids.add(post['mid'])
 
+            # 主帖情感
             label, score = sentiment_score(post['content'])
-            all_results.append([post['mid'], post['content'], label, score])
-            time.sleep(random.uniform(0.2, 0.5))
+            all_results.append([post['mid'], "主帖", post['content'], label, score])
+
+            # 抓取评论
+            comments = fetch_comments(post['mid'], max_pages=3)
+            for com in comments:
+                c_label, c_score = sentiment_score(com)
+                all_results.append([post['mid'], "评论", com, c_label, c_score])
+                time.sleep(random.uniform(0.2, 0.4))
 
     save_to_excel(all_results)
 
@@ -211,4 +292,4 @@ def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
 # 运行示例
 # ---------------------------
 if __name__ == "__main__":
-    run_pipeline(keywords=["上海楼市新政", "上海房地产", "沪六条"], max_pages_per_keyword=5)
+    run_pipeline(keywords=["上海楼市新政", "上海房地产", "沪六条"], max_pages_per_keyword=1)
