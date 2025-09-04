@@ -280,7 +280,7 @@ def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
             all_results.append([post['mid'], "主帖", post['content'], label, score])
 
             # 抓取评论
-            comments = fetch_comments(post['mid'], max_pages=3)
+            comments = fetch_comments(post['mid'], max_pages=max_pages_per_keyword)
             for com in comments:
                 c_label, c_score = sentiment_score(com)
                 all_results.append([post['mid'], "评论", com, c_label, c_score])
@@ -292,4 +292,4 @@ def run_pipeline(keywords=["上海楼市新政"], max_pages_per_keyword=5):
 # 运行示例
 # ---------------------------
 if __name__ == "__main__":
-    run_pipeline(keywords=["上海楼市新政", "上海房地产", "沪六条"], max_pages_per_keyword=1)
+    run_pipeline(keywords=["上海楼市新政", "上海房地产", "沪六条"], max_pages_per_keyword=10)
